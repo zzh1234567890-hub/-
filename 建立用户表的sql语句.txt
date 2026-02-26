@@ -1,0 +1,639 @@
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
+import mysql.connector
+from mysql.connector import Error
+import pandas as pd
+import numpy as np
+import joblib
+import json
+from datetime import datetime, timedelta
+import warnings
+import os
+import hashlib
+import secrets
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+
+warnings.filterwarnings('ignore')
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-change-this-in-production'  # 在生产环境中更改此密钥
+
+# 数据库配置
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'lcy1106',
+    'database': '商品房价格'
+}
+
+
+class DatabaseManager:
+    def __init__(self, config):
+        self.config = config
+
+    def get_connection(self):
+        try:
+            return mysql.connector.connect(**self.config)
+        except Error as e:
+            print(f"数据库连接错误: {e}")
+            return None
+
+    def execute_query(self, query, params=None):
+        conn = self.get_connection()
+        if not conn:
+            return None
+
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(query, params or ())
+            result = cursor.fetchall()
+            return result
+        except Error as e:
+            print(f"查询错误: {e}")
+            return None
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def execute_update(self, query, params=None):
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            conn.commit()
+            affected_rows = cursor.rowcount
+            return affected_rows > 0
+        except Error as e:
+            print(f"更新错误: {e}")
+            conn.rollback()
+            return False
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+
+
+db = DatabaseManager(DB_CONFIG)
+
+
+class UserManager:
+    def __init__(self, db_manager):
+        self.db = db_manager
+
+    def create_user(self, username, email, password, full_name):
+        """创建新用户"""
+        password_hash = generate_password_hash(password)
+        query = """
+        INSERT INTO users (username, email, password_hash, full_name)
+        VALUES (%s, %s, %s, %s)
+        """
+        return self.db.execute_update(query, (username, email, password_hash, full_name))
+
+    def authenticate_user(self, username, password):
+        """验证用户登录"""
+        query = "SELECT * FROM users WHERE username = %s AND is_active = TRUE"
+        users = self.db.execute_query(query, (username,))
+
+        if users and check_password_hash(users[0]['password_hash'], password):
+            # 更新最后登录时间
+            update_query = "UPDATE users SET last_login = NOW() WHERE id = %s"
+            self.db.execute_update(update_query, (users[0]['id'],))
+            return users[0]
+        return None
+
+    def get_user_by_id(self, user_id):
+        """根据ID获取用户"""
+        query = "SELECT * FROM users WHERE id = %s AND is_active = TRUE"
+        users = self.db.execute_query(query, (user_id,))
+        return users[0] if users else None
+
+    def create_session(self, user_id):
+        """创建用户会话"""
+        session_token = secrets.token_urlsafe(32)
+        expires_at = datetime.now() + timedelta(days=7)  # 7天过期
+
+        query = """
+        INSERT INTO user_sessions (user_id, session_token, expires_at)
+        VALUES (%s, %s, %s)
+        """
+        if self.db.execute_update(query, (user_id, session_token, expires_at)):
+            return session_token
+        return None
+
+    def validate_session(self, session_token):
+        """验证会话"""
+        query = """
+        SELECT s.*, u.* FROM user_sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.session_token = %s AND s.expires_at > NOW() AND s.is_active = TRUE AND u.is_active = TRUE
+        """
+        sessions = self.db.execute_query(query, (session_token,))
+        return sessions[0] if sessions else None
+
+    def invalidate_session(self, session_token):
+        """使会话失效"""
+        query = "UPDATE user_sessions SET is_active = FALSE WHERE session_token = %s"
+        return self.db.execute_update(query, (session_token,))
+
+
+user_manager = UserManager(db)
+
+
+def login_required(f):
+    """登录验证装饰器"""
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+class HousePricePredictor:
+    def __init__(self):
+        self.traditional_models = {}
+        self.deep_learning_model = None
+        self.scaler = None
+        self.label_encoders = {}
+        self.feature_columns = []
+        self.model_info = {}
+        self.load_models()
+
+    def load_models(self):
+        try:
+            if not os.path.exists('models') or not os.path.exists('models/model_info.pkl'):
+                print("模型文件不存在，请先运行 model_trainer.py 训练模型")
+                return False
+
+            # 加载模型信息
+            self.model_info = joblib.load('models/model_info.pkl')
+            self.feature_columns = self.model_info['feature_columns']
+
+            # 加载标准化器和编码器
+            if os.path.exists('models/scaler.pkl'):
+                self.scaler = joblib.load('models/scaler.pkl')
+                print("✅ 成功加载标准化器")
+
+            if os.path.exists('models/label_encoders.pkl'):
+                self.label_encoders = joblib.load('models/label_encoders.pkl')
+                print(f"✅ 加载了 {len(self.label_encoders)} 个标签编码器")
+
+            # 加载传统机器学习模型
+            model_names = ['random_forest', 'gradient_boosting', 'linear_regression', 'svr']
+            for name in model_names:
+                model_path = f'models/{name}_model.pkl'
+                if os.path.exists(model_path):
+                    self.traditional_models[name] = joblib.load(model_path)
+
+            # 加载深度学习模型（使用SavedModel格式）
+            if self.model_info.get('tensorflow_available', False):
+                try:
+                    import tensorflow as tf
+                    if os.path.exists('models/neural_network_model'):
+                        self.deep_learning_model = tf.keras.models.load_model('models/neural_network_model')
+                        print("✅ 成功加载深度学习模型")
+                except Exception as e:
+                    print(f"⚠️ 加载深度学习模型失败: {e}")
+
+            total_models = len(self.traditional_models) + (1 if self.deep_learning_model else 0)
+            print(
+                f"✅ 成功加载 {total_models} 个模型 (传统: {len(self.traditional_models)}, 深度学习: {1 if self.deep_learning_model else 0})")
+            return True
+
+        except Exception as e:
+            print(f"❌ 加载模型失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def predict(self, features, model_name):
+        try:
+            if self.scaler is None:
+                print("❌ 标准化器未加载")
+                return 0
+
+            # 传统机器学习模型预测
+            if model_name in self.traditional_models:
+                model = self.traditional_models[model_name]
+
+                if model_name == 'svr':
+                    features_scaled = self.scaler.transform([features])
+                    prediction = model.predict(features_scaled)[0]
+                else:
+                    prediction = model.predict([features])[0]
+
+                return max(0, prediction)
+
+            # 深度学习模型预测
+            elif model_name == 'neural_network' and self.deep_learning_model is not None:
+                features_scaled = self.scaler.transform([features])
+                prediction = self.deep_learning_model.predict(features_scaled, verbose=0)[0][0]
+                return max(0, prediction)
+
+            else:
+                print(f"⚠️ 未找到模型: {model_name}")
+                return 0
+
+        except Exception as e:
+            print(f"❌ 预测错误 ({model_name}): {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
+
+    def get_model_comparison(self):
+        return self.model_info.get('model_scores', {})
+
+
+predictor = HousePricePredictor()
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+
+        user = user_manager.authenticate_user(username, password)
+        if user:
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['full_name'] = user['full_name']
+            flash('登录成功！', 'success')
+            return redirect(url_for('index'))
+        else:
+            flash('用户名或密码错误！', 'error')
+
+    return render_template('login.html')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        full_name = request.form['full_name']
+
+        if user_manager.create_user(username, email, password, full_name):
+            flash('注册成功！请登录。', 'success')
+            return redirect(url_for('login'))
+        else:
+            flash('注册失败！用户名或邮箱可能已存在。', 'error')
+
+    return render_template('register.html')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('已成功退出登录！', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/')
+@login_required
+def index():
+    return render_template('index.html')
+
+
+@app.route('/api/predict', methods=['POST'])
+@login_required
+def predict_price():
+    try:
+        data = request.json
+
+        # 构建特征字典
+        feature_mapping = {
+            '土地移转总面积平方公尺': float(data.get('land_area', 0)),
+            '建物移转总面积平方公尺': float(data.get('building_area', 0)),
+            '房龄': float(data.get('age', 0)),
+            '建物现况格局_房': int(data.get('rooms', 0)),
+            '建物现况格局_厅': int(data.get('halls', 0)),
+            '建物现况格局_卫': int(data.get('bathrooms', 0)),
+            '学校_500内': int(data.get('school_nearby', 0)),
+            '公园_500内': int(data.get('park_nearby', 0)),
+            '公交车站_500内': int(data.get('bus_nearby', 0)),
+            '捷运站_500内': int(data.get('mrt_nearby', 0)),
+            '嫌恶设施_500内': int(data.get('bad_facility_nearby', 0)),
+            '五大行库平均房贷利率(%)': float(data.get('loan_rate', 2.5)),
+            '失业率(%)': float(data.get('unemployment_rate', 3.5)),
+            '总楼层数': int(data.get('total_floors', 10)),
+            '移转层次': int(data.get('floor', 5)),
+            '便利设施指数': float(data.get('convenience_index', 3)),
+            '房价所得比': float(data.get('price_income_ratio', 15)),
+            '贷款负担率': float(data.get('loan_burden_ratio', 35)),
+            '综合所得总额_平均数(万元)': float(data.get('average_income', 100)),
+            '年_公元': int(data.get('year', 2023)),
+            '月': int(data.get('month', 6))
+        }
+
+        # 按照训练时的特征顺序构建特征向量
+        features = []
+        for col in predictor.feature_columns:
+            features.append(feature_mapping.get(col, 0))
+
+        print(f"🔍 预测特征向量长度: {len(features)}")
+        print(f"🔍 预期特征数量: {len(predictor.feature_columns)}")
+
+        # 使用所有模型进行预测
+        predictions = {}
+
+        # 传统机器学习模型
+        for model_name in predictor.traditional_models.keys():
+            pred = predictor.predict(features, model_name)
+            predictions[model_name] = {
+                'price': round(pred, 2),
+                'formatted': f"{pred:,.0f}",
+                'type': 'traditional'
+            }
+
+        # 深度学习模型
+        if predictor.deep_learning_model is not None:
+            pred = predictor.predict(features, 'neural_network')
+            predictions['neural_network'] = {
+                'price': round(pred, 2),
+                'formatted': f"{pred:,.0f}",
+                'type': 'deep_learning'
+            }
+
+        # 获取最佳模型的预测结果
+        best_traditional = predictor.model_info.get('best_traditional_model')
+        best_deep_learning = predictor.model_info.get('best_deep_learning_model')
+
+        best_prediction = None
+        if best_deep_learning and best_deep_learning in predictions:
+            best_prediction = predictions[best_deep_learning]
+        elif best_traditional and best_traditional in predictions:
+            best_prediction = predictions[best_traditional]
+        elif predictions:
+            best_prediction = list(predictions.values())[0]
+
+        return jsonify({
+            'success': True,
+            'predictions': predictions,
+            'best_prediction': best_prediction,
+            'best_traditional_model': best_traditional,
+            'best_deep_learning_model': best_deep_learning
+        })
+
+    except Exception as e:
+        print(f"❌ 预测API错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data')
+@login_required
+def get_data():
+    try:
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 20))
+        search = request.args.get('search', '')
+        city_filter = request.args.get('city', '')
+
+        offset = (page - 1) * limit
+
+        # 构建查询条件
+        where_conditions = ["1=1"]
+        params = []
+
+        if search:
+            where_conditions.append("(`土地位置建物门牌` LIKE %s OR `县市` LIKE %s OR `乡镇市区` LIKE %s)")
+            search_param = f"%{search}%"
+            params.extend([search_param, search_param, search_param])
+
+        if city_filter:
+            where_conditions.append("`县市` = %s")
+            params.append(city_filter)
+
+        where_clause = " AND ".join(where_conditions)
+
+        # 查询数据
+        query = f"""
+        SELECT ID, `交易年月日`, `县市`, `乡镇市区`, `土地位置建物门牌`, 
+               `建物移转总面积平方公尺`, `总价元`, `单价元平方公尺`, 
+               `房龄`,
+               `建物现况格局_房`, `建物现况格局_厅`, `建物现况格局_卫`
+        FROM house_price 
+        WHERE {where_clause}
+        ORDER BY ID DESC
+        LIMIT {limit} OFFSET {offset}
+        """
+
+        data = db.execute_query(query, params)
+
+        # 获取总数
+        count_query = f"SELECT COUNT(*) as total FROM house_price WHERE {where_clause}"
+        count_result = db.execute_query(count_query, params)
+        total = count_result[0]['total'] if count_result else 0
+
+        return jsonify({
+            'success': True,
+            'data': data,
+            'total': total,
+            'page': page,
+            'limit': limit
+        })
+    except Exception as e:
+        print(f"❌ 数据查询错误: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/cities')
+@login_required
+def get_cities():
+    try:
+        query = "SELECT DISTINCT `县市` FROM house_price ORDER BY `县市`"
+        data = db.execute_query(query)
+        cities = [row['县市'] for row in data] if data else []
+        return jsonify({'success': True, 'cities': cities})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/map_data')
+@login_required
+def get_map_data():
+    try:
+        city = request.args.get('city', '')
+        limit = int(request.args.get('limit', 500))
+
+        where_clause = """
+        `纬度` IS NOT NULL AND `经度` IS NOT NULL 
+        AND `纬度` != 0 AND `经度` != 0 
+        AND `纬度` BETWEEN 20 AND 30 
+        AND `经度` BETWEEN 115 AND 125
+        """
+        params = []
+
+        if city:
+            where_clause += " AND `县市` = %s"
+            params.append(city)
+
+        query = f"""
+        SELECT `纬度`, `经度`, `总价元`, `县市`, `乡镇市区`, `土地位置建物门牌`,
+               `建物移转总面积平方公尺`, `单价元平方公尺`, `房龄`
+        FROM house_price 
+        WHERE {where_clause}
+        ORDER BY RAND()
+        LIMIT {limit}
+        """
+
+        data = db.execute_query(query, params)
+        return jsonify({'success': True, 'data': data or []})
+    except Exception as e:
+        print(f"❌ 地图数据查询错误: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/price_trend')
+@login_required
+def get_price_trend():
+    try:
+        city = request.args.get('city', '')
+
+        where_clause = "`单价元平方公尺` > 0 AND `年_公元` IS NOT NULL AND `月` IS NOT NULL"
+        params = []
+
+        if city:
+            where_clause += " AND `县市` = %s"
+            params.append(city)
+
+        query = f"""
+        SELECT `县市`, `年_公元`, `月`, 
+               AVG(`单价元平方公尺`) as avg_price,
+               COUNT(*) as transaction_count
+        FROM house_price 
+        WHERE {where_clause}
+        GROUP BY `县市`, `年_公元`, `月`
+        HAVING transaction_count >= 3
+        ORDER BY `年_公元`, `月`
+        LIMIT 1000
+        """
+
+        data = db.execute_query(query, params)
+
+        if not data:
+            return jsonify({'success': True, 'data': {}})
+
+        # 按城市分组数据
+        trend_data = {}
+        for row in data:
+            city_name = row['县市']
+            if city_name not in trend_data:
+                trend_data[city_name] = []
+
+            trend_data[city_name].append({
+                'date': f"{row['年_公元']}-{row['月']:02d}-01",
+                'price': round(float(row['avg_price']), 2),
+                'count': row['transaction_count']
+            })
+
+        return jsonify({'success': True, 'data': trend_data})
+    except Exception as e:
+        print(f"❌ 价格趋势查询错误: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/transaction_volume')
+@login_required
+def get_transaction_volume():
+    try:
+        city = request.args.get('city', '')
+
+        where_clause = "1=1"
+        params = []
+
+        if city:
+            where_clause += " AND `县市` = %s"
+            params.append(city)
+
+        query = f"""
+        SELECT `县市`, `乡镇市区`, COUNT(*) as volume,
+               AVG(`单价元平方公尺`) as avg_price
+        FROM house_price 
+        WHERE {where_clause}
+        GROUP BY `县市`, `乡镇市区`
+        ORDER BY volume DESC
+        LIMIT 20
+        """
+
+        data = db.execute_query(query, params)
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/delete_record', methods=['POST'])
+@login_required
+def delete_record():
+    try:
+        record_id = request.json.get('id')
+        query = "DELETE FROM house_price WHERE ID = %s"
+        success = db.execute_update(query, (record_id,))
+        return jsonify({'success': success})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/update_record', methods=['POST'])
+@login_required
+def update_record():
+    try:
+        data = request.json
+        record_id = data.get('id')
+
+        # 构建更新语句
+        update_fields = []
+        params = []
+
+        field_mapping = {
+            'total_price': '总价元',
+            'unit_price': '单价元平方公尺',
+            'building_area': '建物移转总面积平方公尺',
+            'age': '房龄'
+        }
+
+        for key, db_field in field_mapping.items():
+            if key in data and data[key] is not None:
+                update_fields.append(f"`{db_field}` = %s")
+                params.append(data[key])
+
+        if not update_fields:
+            return jsonify({'success': False, 'error': '没有要更新的字段'})
+
+        params.append(record_id)
+        query = f"UPDATE house_price SET {', '.join(update_fields)} WHERE ID = %s"
+
+        success = db.execute_update(query, params)
+        return jsonify({'success': success})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/model_info')
+@login_required
+def get_model_info():
+    try:
+        model_comparison = predictor.get_model_comparison()
+        return jsonify({
+            'success': True,
+            'model_scores': model_comparison,
+            'best_traditional_model': predictor.model_info.get('best_traditional_model'),
+            'best_deep_learning_model': predictor.model_info.get('best_deep_learning_model'),
+            'feature_count': len(predictor.feature_columns),
+            'tensorflow_available': predictor.model_info.get('tensorflow_available', False)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)

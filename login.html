@@ -1,0 +1,57 @@
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database_checker import DatabaseChecker
+
+
+def main():
+    print("🔍 开始数据库诊断...")
+
+    DB_CONFIG = {
+        'host': 'localhost',
+        'user': 'root',
+        'password': 'lcy1106',
+        'database': '商品房价格'
+    }
+
+    checker = DatabaseChecker(DB_CONFIG)
+
+    # 检查表结构
+    print("\n1. 检查表结构:")
+    columns = checker.check_table_structure()
+
+    if columns:
+        print(f"\n✅ 找到 {len(columns)} 个字段")
+
+        # 检查关键字段
+        key_fields = ['ID', '总价', '单价', '面积', '房龄']
+        missing_fields = []
+
+        for field in key_fields:
+            found = any(field in col for col in columns)
+            if found:
+                print(f"✅ 找到包含 '{field}' 的字段")
+            else:
+                missing_fields.append(field)
+                print(f"❌ 未找到包含 '{field}' 的字段")
+
+        if missing_fields:
+            print(f"\n⚠️  缺失关键字段: {missing_fields}")
+            print("建议检查数据库表结构或字段命名")
+
+    # 检查数据样本
+    print("\n2. 检查数据样本:")
+    sample_data = checker.check_data_sample()
+
+    if sample_data:
+        print(f"✅ 成功获取 {len(sample_data)} 条样本数据")
+    else:
+        print("❌ 无法获取样本数据")
+
+    print("\n🎉 数据库诊断完成！")
+
+
+if __name__ == "__main__":
+    main()

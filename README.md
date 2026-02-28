@@ -47,77 +47,41 @@
 住房价格预测系统/
 
 ├─ 后端/                 # 后端服务核心代码
-
 │  ├─ app/                # FastAPI应用入口
-
 │  │  └─ main.py          # 主应用文件
-
 │  ├─ config/             # 配置文件目录
-
 │  │  └─ config.py        # 数据库/模型配置
-
 │  ├─ models/             # 预测模型实现
-
 │  │  ├─ lstm_model.py    # LSTM价格预测模型
-
 │  │  ├─ transformer_model.py # Transformer模型
-
 │  │  └─ traditional_models.py # 传统机器学习模型
-
 │  └─ utils/              # 工具模块
-
 │     └─ data_loader.py   # 数据加载器
-
 ├─ data/                 # 数据处理模块
-
 │  ├─ raw_data/           # 原始数据目录
-
 │  │  ├─ building_structure.csv # 房屋结构数据
-
 │  │  ├─ economic_indicators.csv # 经济指标数据
-
 │  │  ├─ houseprice.csv   # 历史房价数据
-
 │  │  └─ ...              # 其他子表
-
 │  └─ processed_data/     # 预处理后数据
-
 │     └─ scaled_features.npy # 标准化特征
-
 ├─ frontend/             # 前端应用
-
 │  ├─ src/                # 源码目录
-
 │  │  ├─ components/      # React组件
-
 │  │  │  ├─ MapChart.js   # 地图可视化组件
-
 │  │  │  ├─ TrendGraph.js # 价格趋势组件
-
 │  │  │  └─ ComparePanel.js # 多模型对比面板
-
 │  │  ├─ services/        # API调用
-
 │  │  └─ App.js           # 主应用组件
-
 │  ├─ public/             # 静态资源
-
 │  └─ package.json        # 依赖配置
-
 ├─ 脚本/                 # 数据处理脚本
-
 │  ├─ data_integration.py # 多源数据融合
-
 │  └─ feature_engineering.py # 特征工程
-
 ├─ 模型/                 # 训练好的模型
-
 │  ├─ lstm_model.keras
-
 │  ├─ transformer_model.keras
-
 │  └─ ...                 # 其他模型文件
-
 └─ README.md             # 项目说明文档
 ```
 ---
